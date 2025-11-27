@@ -235,6 +235,209 @@ module Utils
       destination = Pathname(to)
       destination.dirname.mkpath
 
+      # Extract URL from args (typically the last argument)
+      url = args.last.to_s
+
+      # Experimental feature: only use axel if explicitly enabled
+      use_axel = ENV["HOMEBREW_USE_AXEL"] == "1" &&
+                 url.start_with?("http://", "https://")
+
+      if use_axel
+        # Extract checksum if provided
+        checksum = options.delete(:checksum)
+
+        # Get expected file size from headers before download
+        expected_size = get_content_length(url, args, options)
+
+        # Try axel download
+        axel_result = try_axel_download(args, destination, url, options)
+
+        if axel_result
+          # Verify downloaded file
+          if verify_downloaded_file(destination, expected_size, checksum:)
+            $stderr.puts "✓ Downloaded with axel (verified)"
+            return axel_result
+          else
+            $stderr.puts "⚠ axel: file verification failed, falling back to curl"
+            destination.delete if destination.exist?
+          end
+        end
+      end
+
+      # Fallback to curl (also used when HOMEBREW_USE_AXEL != "1")
+      curl_download_original(args, destination, try_partial, options)
+    end
+
+    private
+
+    sig {
+      params(
+        args:        T::Array[T.any(String, T.untyped)],
+        destination: Pathname,
+        url:         String,
+        options:     T::Hash[Symbol, T.untyped],
+      ).returns(T.nilable(SystemCommand::Result))
+    }
+    def try_axel_download(args, destination, url, options)
+      # Find axel binary
+      axel_bin = find_axel_binary
+      return nil unless axel_bin
+
+      # Build axel arguments
+      axel_args = ["-o", destination.to_s]
+
+      # Parse curl args and convert to axel args
+      i = 0
+      headers = []
+      user_agent = nil
+
+      while i < args.length
+        case args[i].to_s
+        when "--header"
+          headers << args[i + 1].to_s if i + 1 < args.length
+          i += 2
+        when "--user-agent"
+          user_agent = args[i + 1].to_s if i + 1 < args.length
+          i += 2
+        when "--location", "--remote-time", "--fail", "--progress-bar",
+             "--silent", "--verbose", "--globoff", "--show-error"
+          # These are curl-specific flags that axel doesn't have direct equivalents for
+          # We can safely skip them for axel
+          i += 1
+        when "--cookie", "--disable", "--config", "--connect-timeout",
+             "--max-time", "--retry", "--retry-max-time", "--referer",
+             "--continue-at", "--output"
+          # Skip these curl options and their values
+          i += 2
+        else
+          # Unknown option or URL - skip
+          i += 1
+        end
+      end
+
+      # Add headers to axel args
+      headers.each do |header|
+        axel_args << "-H" << header
+      end
+
+      # Add user-agent if specified
+      axel_args << "-U" << user_agent if user_agent
+
+      # Add GitHub Container Registry authentication if needed
+      if url.include?("ghcr.io") && ENV["HOMEBREW_GITHUB_PACKAGES_AUTH"]
+        auth_header = "Authorization: #{ENV["HOMEBREW_GITHUB_PACKAGES_AUTH"]}"
+        axel_args << "-H" << auth_header unless headers.include?(auth_header)
+      end
+
+      # Add URL as the last argument
+      axel_args << url
+
+      # Filter out curl-specific options from system_command options
+      axel_options = options.except(
+        :retries, :show_error, :connect_timeout, :max_time,
+        :retry_max_time, :show_output, :user_agent, :referer, :use_homebrew_curl
+      )
+
+      begin
+        result = system_command axel_bin, args: axel_args, print_stderr: false, **axel_options
+        result.assert_success!
+        result  # Verification will be done in curl_download
+      rescue ErrorDuringExecution => e
+        # Log the error for debugging
+        $stderr.puts "axel failed: #{e.message}"
+        nil
+      end
+    end
+
+    sig { returns(T.nilable(String)) }
+    def find_axel_binary
+      # Try to find axel via Homebrew formula first
+      begin
+        require "formula"
+        axel_formula = Formula["axel"]
+        axel_path = axel_formula.opt_bin/"axel"
+        return axel_path.to_s if axel_path.exist? && axel_path.executable?
+      rescue FormulaUnavailableError, NameError
+        # Formula not available or not installed
+      end
+
+      # Fallback to common paths
+      [
+        "/opt/homebrew/bin/axel",  # Apple Silicon Mac
+        "/usr/local/bin/axel",      # Intel Mac / Linux
+        "/usr/bin/axel",            # System install
+      ].each do |path|
+        return path if File.exist?(path) && File.executable?(path)
+      end
+
+      # axel not found
+      nil
+    end
+
+    sig {
+      params(
+        url:     String,
+        args:    T::Array[T.any(String, T.untyped)],
+        options: T::Hash[Symbol, T.untyped],
+      ).returns(T.nilable(Integer))
+    }
+    def get_content_length(url, args, options)
+      # Get Content-Length from HTTP headers
+      parsed = curl_headers(*args, **options, wanted_headers: ["content-length"])
+      content_length = parsed.fetch(:responses).last&.fetch(:headers)&.fetch("content-length", nil)
+      content_length&.to_i
+    rescue ErrorDuringExecution => e
+      # If we can't get headers, we'll skip size verification
+      $stderr.puts "Warning: Could not get Content-Length: #{e.message}"
+      nil
+    end
+
+    sig {
+      params(
+        destination:   Pathname,
+        expected_size: T.nilable(Integer),
+        checksum:      T.nilable(String),
+      ).returns(T::Boolean)
+    }
+    def verify_downloaded_file(destination, expected_size, checksum: nil)
+      # File must exist and be readable
+      return false unless destination.exist? && destination.readable?
+
+      actual_size = destination.size
+
+      # Files with 0 bytes are clearly broken
+      return false if actual_size.zero?
+
+      # If we have an expected size, verify it matches
+      if expected_size && expected_size.positive?
+        unless actual_size == expected_size
+          $stderr.puts "Size mismatch: expected #{expected_size} bytes, got #{actual_size} bytes"
+          return false
+        end
+      end
+
+      # Verify checksum if provided
+      if checksum
+        actual_checksum = Digest::SHA256.file(destination).hexdigest
+        unless actual_checksum == checksum
+          $stderr.puts "Checksum mismatch: expected #{checksum}, got #{actual_checksum}"
+          return false
+        end
+      end
+
+      true
+    end
+
+    sig {
+      params(
+        args:        T::Array[T.any(String, T.untyped)],
+        destination: Pathname,
+        try_partial: T::Boolean,
+        options:     T::Hash[Symbol, T.untyped],
+      ).returns(T.nilable(SystemCommand::Result))
+    }
+    def curl_download_original(args, destination, try_partial, options)
+      # Original curl_download logic
       args = ["--location", *args]
 
       if try_partial && destination.exist?
@@ -246,21 +449,16 @@ module Utils
           {}
         end
 
-        # Any value for `Accept-Ranges` other than `none` indicates that the server
-        # supports partial requests. Its absence indicates no support.
         supports_partial = headers.fetch("accept-ranges", "none") != "none"
         content_length = headers["content-length"]&.to_i
 
         if supports_partial
-          # We've already downloaded all bytes.
           return if destination.size == content_length
-
           args = ["--continue-at", "-", *args]
         end
       end
 
       args = ["--remote-time", "--output", destination.to_s, *args]
-
       curl(*args, **options)
     end
 
