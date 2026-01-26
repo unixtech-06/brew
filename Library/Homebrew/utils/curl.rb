@@ -245,6 +245,7 @@ module Utils
       if use_axel
         # Extract checksum if provided
         checksum = options.delete(:checksum)
+        checksum_type = options.delete(:checksum_type) || :sha256
 
         # Get expected file size from headers before download
         expected_size = get_content_length(url, args, options)
@@ -254,7 +255,7 @@ module Utils
 
         if axel_result
           # Verify downloaded file
-          if verify_downloaded_file(destination, expected_size, checksum:)
+          if verify_downloaded_file(destination, expected_size, checksum:, checksum_type:)
             $stderr.puts "✓ Downloaded with axel (verified)"
             return axel_result
           else
@@ -397,9 +398,10 @@ module Utils
         destination:   Pathname,
         expected_size: T.nilable(Integer),
         checksum:      T.nilable(String),
+        checksum_type: Symbol,
       ).returns(T::Boolean)
     }
-    def verify_downloaded_file(destination, expected_size, checksum: nil)
+    def verify_downloaded_file(destination, expected_size, checksum: nil, checksum_type: :sha256)
       # File must exist and be readable
       return false unless destination.exist? && destination.readable?
 
@@ -418,7 +420,15 @@ module Utils
 
       # Verify checksum if provided
       if checksum
-        actual_checksum = Digest::SHA256.file(destination).hexdigest
+        digest_class = case checksum_type
+        when :sha256 then Digest::SHA256
+        when :sha512 then Digest::SHA512
+        else
+          $stderr.puts "Unsupported checksum type: #{checksum_type}"
+          return false
+        end
+
+        actual_checksum = digest_class.file(destination).hexdigest
         unless actual_checksum == checksum
           $stderr.puts "Checksum mismatch: expected #{checksum}, got #{actual_checksum}"
           return false
@@ -449,10 +459,13 @@ module Utils
           {}
         end
 
+        # Any value for `Accept-Ranges` other than `none` indicates that the server
+        # supports partial requests. Its absence indicates no support.
         supports_partial = headers.fetch("accept-ranges", "none") != "none"
         content_length = headers["content-length"]&.to_i
 
         if supports_partial
+          # We've already downloaded all bytes.
           return if destination.size == content_length
           args = ["--continue-at", "-", *args]
         end
